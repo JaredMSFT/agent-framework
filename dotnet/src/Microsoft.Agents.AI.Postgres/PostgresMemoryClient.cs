@@ -227,6 +227,22 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
         ValidateThreadScope(scope);
         await this.EnsureSchemaAsync(cancellationToken).ConfigureAwait(false);
 
+        var processingLock = this.GetProcessingLock(scope, includeThread: true);
+        await processingLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await this.ExtractMemoriesCoreAsync(scope, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            processingLock.Release();
+        }
+    }
+
+    private async Task<int> ExtractMemoriesCoreAsync(
+        PostgresMemoryScope scope,
+        CancellationToken cancellationToken)
+    {
         var scopeKey = PostgresMemoryStore.ComputeScopeKey(scope, includeThread: true);
         var state = await this._store.GetProcessingStateAsync(scopeKey, cancellationToken).ConfigureAwait(false);
         var turns = await this._store.GetTurnsAfterAsync(scope, state.FactThroughTurnId, cancellationToken).ConfigureAwait(false);
@@ -311,6 +327,22 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
         ValidateThreadScope(scope);
         await this.EnsureSchemaAsync(cancellationToken).ConfigureAwait(false);
 
+        var processingLock = this.GetProcessingLock(scope, includeThread: true);
+        await processingLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await this.GenerateThreadSummaryCoreAsync(scope, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            processingLock.Release();
+        }
+    }
+
+    private async Task<PostgresMemoryRecord?> GenerateThreadSummaryCoreAsync(
+        PostgresMemoryScope scope,
+        CancellationToken cancellationToken)
+    {
         var (previous, coversThrough) = await this._store.GetLatestSummaryAsync(
             scope,
             PostgresMemoryType.Summary,
@@ -341,6 +373,15 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
             latestTurnId,
             cancellationToken).ConfigureAwait(false);
 
+        if (!id.HasValue)
+        {
+            var (latest, _) = await this._store.GetLatestSummaryAsync(
+                scope,
+                PostgresMemoryType.Summary,
+                cancellationToken).ConfigureAwait(false);
+            return latest;
+        }
+
         var scopeKey = PostgresMemoryStore.ComputeScopeKey(scope, includeThread: true);
         var state = await this._store.GetProcessingStateAsync(scopeKey, cancellationToken).ConfigureAwait(false);
         await this._store.UpsertProcessingStateAsync(
@@ -348,7 +389,7 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
             state with { SummaryThroughTurnId = latestTurnId },
             cancellationToken).ConfigureAwait(false);
 
-        return CreateSummaryRecord(id, scope, PostgresMemoryType.Summary, summary);
+        return CreateSummaryRecord(id.Value, scope, PostgresMemoryType.Summary, summary);
     }
 
     /// <summary>
@@ -383,6 +424,11 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
             userScope,
             PostgresMemoryType.UserSummary,
             cancellationToken).ConfigureAwait(false);
+        var (_, latestTurnId) = await this._store.GetTurnStatsAfterAsync(
+            userScope,
+            0,
+            includeThread: false,
+            cancellationToken).ConfigureAwait(false);
         var memories = await this._store.GetActiveMemoriesAsync(
             userScope,
             s_derivedMemoryTypes,
@@ -410,11 +456,6 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
         }
 
         var embedding = await this._embeddingGenerator.GenerateVectorAsync(summary, cancellationToken: cancellationToken).ConfigureAwait(false);
-        var (_, latestTurnId) = await this._store.GetTurnStatsAfterAsync(
-            userScope,
-            0,
-            includeThread: false,
-            cancellationToken).ConfigureAwait(false);
         var id = await this._store.InsertSummaryAsync(
             userScope,
             PostgresMemoryType.UserSummary,
@@ -423,6 +464,15 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
             latestTurnId,
             cancellationToken).ConfigureAwait(false);
 
+        if (!id.HasValue)
+        {
+            var (latest, _) = await this._store.GetLatestSummaryAsync(
+                userScope,
+                PostgresMemoryType.UserSummary,
+                cancellationToken).ConfigureAwait(false);
+            return latest;
+        }
+
         var scopeKey = PostgresMemoryStore.ComputeScopeKey(userScope, includeThread: false);
         var state = await this._store.GetProcessingStateAsync(scopeKey, cancellationToken).ConfigureAwait(false);
         await this._store.UpsertProcessingStateAsync(
@@ -430,7 +480,7 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
             state with { UserSummaryThroughTurnId = latestTurnId },
             cancellationToken).ConfigureAwait(false);
 
-        return CreateSummaryRecord(id, userScope, PostgresMemoryType.UserSummary, summary);
+        return CreateSummaryRecord(id.Value, userScope, PostgresMemoryType.UserSummary, summary);
     }
 
     /// <summary>
@@ -528,8 +578,8 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
         await processingLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            _ = await this.ExtractMemoriesAsync(scope, cancellationToken).ConfigureAwait(false);
-            _ = await this.GenerateThreadSummaryAsync(scope, cancellationToken).ConfigureAwait(false);
+            _ = await this.ExtractMemoriesCoreAsync(scope, cancellationToken).ConfigureAwait(false);
+            _ = await this.GenerateThreadSummaryCoreAsync(scope, cancellationToken).ConfigureAwait(false);
             _ = await this.GenerateUserSummaryAsync(scope, cancellationToken).ConfigureAwait(false);
             _ = await this.ReconcileAsync(scope.ToUserScope(), cancellationToken: cancellationToken).ConfigureAwait(false);
         }
@@ -632,7 +682,7 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
                     cancellationToken).ConfigureAwait(false);
                 if (count >= this._options.FactExtractionEveryNTurns)
                 {
-                    _ = await this.ExtractMemoriesAsync(scope, cancellationToken).ConfigureAwait(false);
+                    _ = await this.ExtractMemoriesCoreAsync(scope, cancellationToken).ConfigureAwait(false);
                     threadState = await this._store.GetProcessingStateAsync(threadKey, cancellationToken).ConfigureAwait(false);
                     if (this._options.ReconcileEveryNExtractions > 0
                         && threadState.ExtractionRuns % this._options.ReconcileEveryNExtractions == 0)
@@ -651,7 +701,7 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
                     cancellationToken).ConfigureAwait(false);
                 if (count >= this._options.ThreadSummaryEveryNTurns)
                 {
-                    _ = await this.GenerateThreadSummaryAsync(scope, cancellationToken).ConfigureAwait(false);
+                    _ = await this.GenerateThreadSummaryCoreAsync(scope, cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -709,67 +759,78 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
         out List<ExtractedMemory> results)
     {
         results = [];
-        if (!TryExtractJsonArray(responseText, out var json))
+        if (string.IsNullOrWhiteSpace(responseText))
         {
             return false;
         }
 
         try
         {
-            using var document = JsonDocument.Parse(json);
+            using var document = JsonDocument.Parse(responseText.Trim());
             if (document.RootElement.ValueKind != JsonValueKind.Array)
             {
                 return false;
             }
 
-            var itemCount = 0;
             foreach (var item in document.RootElement.EnumerateArray())
             {
-                itemCount++;
                 if (item.ValueKind != JsonValueKind.Object
                     || !item.TryGetProperty("content", out var contentElement)
                     || contentElement.ValueKind != JsonValueKind.String
                     || !item.TryGetProperty("memory_type", out var typeElement)
-                    || typeElement.ValueKind != JsonValueKind.String)
+                    || typeElement.ValueKind != JsonValueKind.String
+                    || !item.TryGetProperty("confidence", out var confidenceElement)
+                    || !TryParseScore(confidenceElement, out var confidence))
                 {
-                    continue;
+                    return false;
                 }
 
                 var content = contentElement.GetString()?.Trim();
                 var typeText = typeElement.GetString();
                 if (string.IsNullOrWhiteSpace(content) || !TryParseDerivedMemoryType(typeText, out var memoryType))
                 {
-                    continue;
+                    return false;
                 }
 
-                var confidence = item.TryGetProperty("confidence", out var confidenceElement)
-                    && confidenceElement.TryGetDouble(out var parsedConfidence)
-                    ? Math.Clamp(parsedConfidence, 0, 1)
-                    : 0.5;
-                double? salience = item.TryGetProperty("salience", out var salienceElement)
-                    && salienceElement.TryGetDouble(out var parsedSalience)
-                    ? Math.Clamp(parsedSalience, 0, 1)
-                    : null;
+                double? salience = null;
+                if (item.TryGetProperty("salience", out var salienceElement)
+                    && salienceElement.ValueKind != JsonValueKind.Null)
+                {
+                    if (!TryParseScore(salienceElement, out var parsedSalience))
+                    {
+                        return false;
+                    }
+
+                    salience = parsedSalience;
+                }
 
                 var tags = new List<string>();
-                if (item.TryGetProperty("tags", out var tagsElement) && tagsElement.ValueKind == JsonValueKind.Array)
+                if (item.TryGetProperty("tags", out var tagsElement)
+                    && tagsElement.ValueKind != JsonValueKind.Null)
                 {
+                    if (tagsElement.ValueKind != JsonValueKind.Array)
+                    {
+                        return false;
+                    }
+
                     foreach (var tagElement in tagsElement.EnumerateArray())
                     {
                         var tag = tagElement.ValueKind == JsonValueKind.String
                             ? tagElement.GetString()?.Trim()
                             : null;
-                        if (!string.IsNullOrWhiteSpace(tag))
+                        if (string.IsNullOrWhiteSpace(tag))
                         {
-                            tags.Add(tag);
+                            return false;
                         }
+
+                        tags.Add(tag);
                     }
                 }
 
                 results.Add(new ExtractedMemory(content, memoryType, confidence, salience, tags));
             }
 
-            return itemCount == 0 || results.Count > 0;
+            return true;
         }
         catch (JsonException)
         {
@@ -782,43 +843,44 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
         out List<ReconciliationDecision> results)
     {
         results = [];
-        if (!TryExtractJsonArray(responseText, out var json))
+        if (string.IsNullOrWhiteSpace(responseText))
         {
             return false;
         }
 
         try
         {
-            using var document = JsonDocument.Parse(json);
+            using var document = JsonDocument.Parse(responseText.Trim());
             if (document.RootElement.ValueKind != JsonValueKind.Array)
             {
                 return false;
             }
 
-            var itemCount = 0;
             foreach (var item in document.RootElement.EnumerateArray())
             {
-                itemCount++;
                 if (item.ValueKind != JsonValueKind.Object
                     || !item.TryGetProperty("superseded_id", out var supersededElement)
                     || !item.TryGetProperty("winner_id", out var winnerElement)
+                    || supersededElement.ValueKind != JsonValueKind.Number
+                    || winnerElement.ValueKind != JsonValueKind.Number
                     || !supersededElement.TryGetInt64(out var supersededId)
-                    || !winnerElement.TryGetInt64(out var winnerId))
+                    || !winnerElement.TryGetInt64(out var winnerId)
+                    || !item.TryGetProperty("reason", out var reasonElement)
+                    || reasonElement.ValueKind != JsonValueKind.String)
                 {
-                    continue;
+                    return false;
                 }
 
-                var reason = item.TryGetProperty("reason", out var reasonElement)
-                    && reasonElement.ValueKind == JsonValueKind.String
-                    ? reasonElement.GetString()?.Trim()
-                    : null;
-                results.Add(new ReconciliationDecision(
-                    supersededId,
-                    winnerId,
-                    string.IsNullOrWhiteSpace(reason) ? "contradict" : reason));
+                var reason = reasonElement.GetString()?.Trim();
+                if (string.IsNullOrWhiteSpace(reason))
+                {
+                    return false;
+                }
+
+                results.Add(new ReconciliationDecision(supersededId, winnerId, reason));
             }
 
-            return itemCount == 0 || results.Count > 0;
+            return true;
         }
         catch (JsonException)
         {
@@ -826,23 +888,13 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
         }
     }
 
-    private static bool TryExtractJsonArray(string? responseText, out string json)
+    private static bool TryParseScore(JsonElement element, out double score)
     {
-        json = string.Empty;
-        if (string.IsNullOrWhiteSpace(responseText))
-        {
-            return false;
-        }
-
-        var start = responseText.IndexOf('[', StringComparison.Ordinal);
-        var end = responseText.LastIndexOf(']');
-        if (start < 0 || end < start)
-        {
-            return false;
-        }
-
-        json = responseText.Substring(start, end - start + 1);
-        return true;
+        score = 0;
+        return element.ValueKind == JsonValueKind.Number
+            && element.TryGetDouble(out score)
+            && double.IsFinite(score)
+            && score is >= 0 and <= 1;
     }
 
     private static bool TryParseDerivedMemoryType(string? value, out PostgresMemoryType memoryType)

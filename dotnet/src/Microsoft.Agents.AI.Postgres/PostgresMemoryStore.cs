@@ -580,7 +580,7 @@ internal sealed partial class PostgresMemoryStore : IPostgresMemoryStore
         }
     }
 
-    public async Task<long> InsertSummaryAsync(
+    public async Task<long?> InsertSummaryAsync(
         PostgresMemoryScope scope,
         PostgresMemoryType summaryType,
         string content,
@@ -600,6 +600,7 @@ internal sealed partial class PostgresMemoryStore : IPostgresMemoryStore
                    COALESCE(MAX(version), 0) + 1
             FROM {this._summariesTable}
             WHERE {filter} AND summary_type = @summary_type
+            HAVING COALESCE(MAX(covers_through_turn_id), 0) < @covers_through_turn_id
             RETURNING id;
             """;
 
@@ -634,7 +635,9 @@ internal sealed partial class PostgresMemoryStore : IPostgresMemoryStore
 
                     var id = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
                     await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                    return Convert.ToInt64(id, System.Globalization.CultureInfo.InvariantCulture);
+                    return id is null or DBNull
+                        ? null
+                        : Convert.ToInt64(id, System.Globalization.CultureInfo.InvariantCulture);
                 }
             }
         }
@@ -756,13 +759,18 @@ internal sealed partial class PostgresMemoryStore : IPostgresMemoryStore
 
     public static string ComputeScopeKey(PostgresMemoryScope scope, bool includeThread)
     {
-        var input = string.Join(
-            "\u001f",
-            scope.ApplicationId ?? string.Empty,
-            scope.AgentId ?? string.Empty,
-            scope.UserId ?? string.Empty,
-            includeThread ? scope.ThreadId ?? string.Empty : string.Empty);
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(input)));
+        var input = new StringBuilder();
+        AppendScopeComponent(input, scope.ApplicationId);
+        AppendScopeComponent(input, scope.AgentId);
+        AppendScopeComponent(input, scope.UserId);
+        AppendScopeComponent(input, includeThread ? scope.ThreadId : null);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(input.ToString())));
+    }
+
+    private static void AppendScopeComponent(StringBuilder builder, string? value)
+    {
+        value ??= string.Empty;
+        _ = builder.Append(Encoding.UTF8.GetByteCount(value)).Append(':').Append(value);
     }
 
     private string Qualify(string tableName) => $"\"{this._schema}\".\"{tableName}\"";

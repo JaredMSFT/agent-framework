@@ -83,7 +83,7 @@ internal interface IPostgresMemoryStore
         PostgresMemoryType summaryType,
         CancellationToken cancellationToken);
 
-    Task<long> InsertSummaryAsync(
+    Task<long?> InsertSummaryAsync(
         PostgresMemoryScope scope,
         PostgresMemoryType summaryType,
         string content,

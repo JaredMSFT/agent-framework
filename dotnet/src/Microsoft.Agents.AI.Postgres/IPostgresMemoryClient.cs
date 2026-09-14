@@ -39,6 +39,13 @@ internal interface IPostgresMemoryClient
         CancellationToken cancellationToken);
 
     /// <summary>
+    /// Runs all memory-processing steps immediately.
+    /// </summary>
+    Task ProcessNowAsync(
+        PostgresMemoryScope scope,
+        CancellationToken cancellationToken);
+
+    /// <summary>
     /// Waits for background processing already scheduled by turn writes.
     /// </summary>
     Task FlushAsync(CancellationToken cancellationToken);

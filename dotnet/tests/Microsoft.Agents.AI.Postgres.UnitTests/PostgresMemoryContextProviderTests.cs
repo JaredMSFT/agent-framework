@@ -179,6 +179,26 @@ public sealed class PostgresMemoryContextProviderTests
             Times.Once);
     }
 
+    [Fact]
+    public async Task ProcessNowAsync_ResolvesSessionStateAndDelegatesAsync()
+    {
+        // Arrange
+        var provider = CreateProvider(this._memoryClient.Object);
+        var session = new TestAgentSession();
+        using var cancellationSource = new CancellationTokenSource();
+
+        // Act
+        await provider.ProcessNowAsync(session, cancellationSource.Token);
+
+        // Assert
+        this._memoryClient.Verify(
+            client => client.ProcessNowAsync(
+                It.Is<PostgresMemoryScope>(scope =>
+                    scope.UserId == "user" && scope.ThreadId == "thread"),
+                cancellationSource.Token),
+            Times.Once);
+    }
+
     private static PostgresMemoryContextProvider CreateProvider(
         IPostgresMemoryClient client,
         ILoggerFactory? loggerFactory = null) =>

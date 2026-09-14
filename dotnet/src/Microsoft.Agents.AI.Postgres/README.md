@@ -60,7 +60,9 @@ await memoryProvider.FlushAsync();
 ```
 
 Set `PostgresMemoryClientOptions.AutoProcess` to `false` and call
-`PostgresMemoryClient.ProcessNowAsync` when the application owns processing cadence explicitly.
+`PostgresMemoryContextProvider.ProcessNowAsync` with the current agent session, or call
+`PostgresMemoryClient.ProcessNowAsync` with a scope when the application owns processing cadence
+explicitly.
 
 The database role must be able to create the configured schema and tables when
 `EnsureSchemaOnFirstUse` is enabled. Install the PostgreSQL `vector` extension before deployment,

@@ -147,6 +147,20 @@ public sealed class PostgresMemoryContextProvider : MessageAIContextProvider, IA
     public Task FlushAsync(CancellationToken cancellationToken = default) =>
         this._memoryClient.FlushAsync(cancellationToken);
 
+    /// <summary>
+    /// Runs all memory-processing steps immediately for the scope stored in the specified session.
+    /// </summary>
+    /// <param name="session">The session containing the durable memory scope.</param>
+    /// <param name="cancellationToken">A cancellation token.</param>
+    public Task ProcessNowAsync(
+        AgentSession session,
+        CancellationToken cancellationToken = default)
+    {
+        _ = Throw.IfNull(session);
+        var state = this._sessionState.GetOrInitializeState(session);
+        return this._memoryClient.ProcessNowAsync(state.StorageScope, cancellationToken);
+    }
+
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {

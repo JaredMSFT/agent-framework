@@ -1,13 +1,11 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System;
-using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
-using Pgvector;
 
 namespace Microsoft.Agents.AI.Postgres.UnitTests;
 
@@ -269,6 +267,20 @@ public sealed class PostgresMemoryStoreIntegrationTests : IAsyncLifetime
             new float[] { 1, 0, 0 },
             2,
             CancellationToken.None);
+        var equalThreadId = await store.InsertSummaryAsync(
+            firstThread,
+            PostgresMemoryType.Summary,
+            "Equal coverage.",
+            new float[] { 1, 0, 0 },
+            2,
+            CancellationToken.None);
+        var staleThreadId = await store.InsertSummaryAsync(
+            firstThread,
+            PostgresMemoryType.Summary,
+            "Stale coverage.",
+            new float[] { 1, 0, 0 },
+            1,
+            CancellationToken.None);
         var secondThreadId = await store.InsertSummaryAsync(
             secondThread,
             PostgresMemoryType.Summary,
@@ -297,6 +309,11 @@ public sealed class PostgresMemoryStoreIntegrationTests : IAsyncLifetime
             10,
             CancellationToken.None);
 
+        Assert.NotNull(latestFirstThreadId);
+        Assert.NotNull(secondThreadId);
+        Assert.NotNull(userSummaryId);
+        Assert.Null(equalThreadId);
+        Assert.Null(staleThreadId);
         Assert.Equal(latestFirstThreadId, latestThread.Record?.Id);
         Assert.Equal(2, latestThread.CoversThroughTurnId);
         Assert.Equal(userSummaryId, latestUser.Record?.Id);
@@ -304,7 +321,7 @@ public sealed class PostgresMemoryStoreIntegrationTests : IAsyncLifetime
         Assert.Contains(recentThreads, summary => summary.Id == latestFirstThreadId);
         Assert.Contains(recentThreads, summary => summary.Id == secondThreadId);
 
-        var concurrentInserts = new Task<long>[8];
+        var concurrentInserts = new Task<long?>[8];
         for (var i = 0; i < concurrentInserts.Length; i++)
         {
             concurrentInserts[i] = store.InsertSummaryAsync(
@@ -316,9 +333,10 @@ public sealed class PostgresMemoryStoreIntegrationTests : IAsyncLifetime
                 CancellationToken.None);
         }
 
-        _ = await Task.WhenAll(concurrentInserts);
+        var concurrentIds = await Task.WhenAll(concurrentInserts);
+        Assert.NotNull(concurrentIds[^1]);
         var versionCommand = this._dataSource!.CreateCommand($"""
-            SELECT COUNT(*), COUNT(DISTINCT version), MAX(version)
+            SELECT COUNT(*), COUNT(DISTINCT version), MAX(version), MAX(covers_through_turn_id)
             FROM "{this._schema}"."memory_summaries"
             WHERE application_id = 'app'
               AND agent_id = 'agent'
@@ -332,9 +350,11 @@ public sealed class PostgresMemoryStoreIntegrationTests : IAsyncLifetime
             await using (reader.ConfigureAwait(false))
             {
                 Assert.True(await reader.ReadAsync());
-                Assert.Equal(10, reader.GetInt64(0));
-                Assert.Equal(10, reader.GetInt64(1));
-                Assert.Equal(10, reader.GetInt32(2));
+                var count = reader.GetInt64(0);
+                Assert.InRange(count, 3, 10);
+                Assert.Equal(count, reader.GetInt64(1));
+                Assert.Equal(count, reader.GetInt32(2));
+                Assert.Equal(17, reader.GetInt64(3));
             }
         }
 
