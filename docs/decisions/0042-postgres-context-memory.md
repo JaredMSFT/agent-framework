@@ -13,7 +13,7 @@ deciders: jaredmeade
 Agent Framework provider, but its first implementation placed persistence, retrieval, extraction,
 summarization, and profile maintenance inside the provider itself. This coupled the reusable memory
 engine to one Agent Framework lifecycle adapter. The PostgreSQL integration should separate those
-responsibilities so the memory engine is useful independently and a future Python adapter can share
+responsibilities so the memory engine is useful independently and the .NET and Python adapters share
 the same behavioral contract.
 
 ## Decision Drivers
@@ -23,7 +23,7 @@ the same behavioral contract.
   user summaries.
 - Support confidence filtering, hybrid retrieval, memory reconciliation, and background processing,
   not only fact extraction.
-- Use provider-agnostic `IChatClient` and `IEmbeddingGenerator` abstractions.
+- Use provider-agnostic chat and embedding abstractions in both language implementations.
 - Keep PostgreSQL as the only durable dependency; pgvector supplies semantic retrieval and native
   PostgreSQL full-text search supplies lexical retrieval.
 
@@ -32,11 +32,14 @@ the same behavioral contract.
 The package contains two public layers:
 
 1. `PostgresMemoryClient` is the reusable PostgreSQL ContextMemory engine. It owns storage,
-   retrieval, transformation, cadence-aware background processing, `ProcessNowAsync`, and
-   `FlushAsync`.
-2. `PostgresMemoryContextProvider` is a thin `MessageAIContextProvider` adapter. Before a run it
+   retrieval, transformation, cadence-aware background processing, explicit processing, and
+   background-work flushing.
+2. `PostgresMemoryContextProvider` is a thin Agent Framework lifecycle adapter. Before a run it
    searches the client and retrieves the user summary; after a run it writes conversation turns.
    It does not implement extraction or summarization itself.
+
+The .NET implementation is distributed in `Microsoft.Agents.AI.Postgres`. The Python implementation
+is part of `agent-framework-postgres` and uses Psycopg 3.
 
 ### Memory model
 
@@ -50,16 +53,19 @@ The configured base table name produces four tables:
 
 ### Lifecycle
 
-- `PostgresMemoryContextProvider.ProvideMessagesAsync` performs hybrid vector/full-text search over
-  typed derived memories and independently retrieves the user summary. Both are injected as
-  user-role, explicitly untrusted reference information.
-- `PostgresMemoryContextProvider.StoreAIContextAsync` writes supported input and output messages as
-  turns. A turn write may schedule processing, but the provider does not wait for extraction.
+- The provider's pre-run hook performs hybrid vector/full-text search over typed derived memories
+  and independently retrieves the user summary. Both are injected as user-role, explicitly
+  untrusted reference information.
+- The provider's post-run hook writes supported input and output messages as turns. A turn write may
+  schedule processing, but the provider does not wait for extraction.
+- Both providers support configurable search/request/response message filters and independent
+  storage and search scopes.
 - `PostgresMemoryClient` extracts typed memories, incrementally updates thread/user summaries,
   applies episodic TTL, folds exact/vector-similar duplicates, and reconciles semantic
   contradictions while retaining supersession history.
-- `FlushAsync` drains in-flight processing before shutdown. `ProcessNowAsync` gives tests,
-  operators, and applications with automatic cadence disabled an explicit processing hook.
+- `FlushAsync`/`flush` drains in-flight processing before shutdown. `ProcessNowAsync`/`process_now`
+  is available through the provider and client layers, giving tests, operators, and applications
+  with automatic cadence disabled an explicit processing hook.
 
 ### Scope
 
@@ -81,10 +87,15 @@ full-text ranking; optional BM25 extensions remain a future enhancement.
 - The memory engine is independently usable and testable instead of being coupled to Agent
   Framework lifecycle types.
 - The provider API is named `PostgresMemoryContextProvider` to make its lifecycle role explicit.
-- Model clients and the Npgsql data source are supplied and owned by the caller. A convenience
+- Model clients and Npgsql/Psycopg data sources are supplied and owned by the caller. A convenience
   provider constructor owns only the `PostgresMemoryClient` it creates, not those dependencies.
 - Summary versions are serialized with PostgreSQL advisory transaction locks, and processing
-  checkpoints are monotonic so concurrent workers cannot move completed work backward.
+  checkpoints are monotonic so concurrent workers cannot move completed work backward. Stale or
+  equal summary coverage is rejected while holding the same lock.
+- Extraction and reconciliation require a complete, schema-valid JSON array response. One malformed
+  item invalidates the full response, and processing checkpoints do not advance.
+- Direct and scheduled thread processing share per-scope locks, and user-summary turn cutoffs are
+  captured before model execution so concurrent turn writes are not checkpointed prematurely.
 - In-process background processing is appropriate for development and low-throughput deployments.
   A durable PostgreSQL processor (for example, an outbox plus worker) is deferred.
 - PostgreSQL `vector` HNSW indexing supports up to 2,000 dimensions; callers using larger embedding
