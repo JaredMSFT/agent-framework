@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -29,6 +30,8 @@ internal sealed partial class PostgresMemoryStore : IPostgresMemoryStore
     private readonly int _embeddingDimensions;
     private readonly int _reciprocalRankFusionK;
     private readonly bool _enableTurnEmbeddings;
+    private readonly bool _enableAzureAiReranking;
+    private readonly PostgresMemoryVectorIndexKind _vectorIndexKind;
     private readonly object _schemaSync = new();
     private Task? _ensureSchemaTask;
 
@@ -43,11 +46,15 @@ internal sealed partial class PostgresMemoryStore : IPostgresMemoryStore
             ? options.EmbeddingDimensions
             : throw new ArgumentOutOfRangeException(
                 nameof(options),
-                "EmbeddingDimensions must be between 1 and 2000 for a pgvector vector HNSW index.");
+                "EmbeddingDimensions must be between 1 and 2000 for the vector index.");
+        this._vectorIndexKind = Enum.IsDefined(options.VectorIndexKind)
+            ? options.VectorIndexKind
+            : throw new ArgumentOutOfRangeException(nameof(options), "VectorIndexKind must be a defined value.");
         this._reciprocalRankFusionK = options.ReciprocalRankFusionK > 0
             ? options.ReciprocalRankFusionK
             : throw new ArgumentOutOfRangeException(nameof(options), "ReciprocalRankFusionK must be greater than zero.");
         this._enableTurnEmbeddings = options.EnableTurnEmbeddings;
+        this._enableAzureAiReranking = options.EnableAzureAiReranking;
 
         this._turnsTable = this.Qualify($"{this._baseTableName}_turns");
         this._memoriesTable = this.Qualify($"{this._baseTableName}_memories");
@@ -69,11 +76,23 @@ internal sealed partial class PostgresMemoryStore : IPostgresMemoryStore
     private async Task EnsureSchemaCoreAsync()
     {
         var turnVectorIndexSql = this._enableTurnEmbeddings
-            ? $"CREATE INDEX IF NOT EXISTS ix_{this._baseTableName}_turns_embedding ON {this._turnsTable} USING hnsw (embedding vector_cosine_ops);"
+            ? this.GetVectorIndexSql(this._turnsTable, $"ix_{this._baseTableName}_turns_embedding", $"ix_{this._baseTableName}_turns_diskann")
+            : string.Empty;
+        var memoryVectorIndexSql = this.GetVectorIndexSql(
+            this._memoriesTable,
+            $"ix_{this._baseTableName}_memories_embedding",
+            $"ix_{this._baseTableName}_memories_diskann");
+        var vectorIndexExtensionSql = this._vectorIndexKind == PostgresMemoryVectorIndexKind.DiskAnn
+            ? "CREATE EXTENSION IF NOT EXISTS pg_diskann;"
+            : string.Empty;
+        var rerankingExtensionSql = this._enableAzureAiReranking
+            ? "CREATE EXTENSION IF NOT EXISTS azure_ai;"
             : string.Empty;
 
         var sql = $"""
             CREATE EXTENSION IF NOT EXISTS vector;
+            {vectorIndexExtensionSql}
+            {rerankingExtensionSql}
             CREATE SCHEMA IF NOT EXISTS "{this._schema}";
 
             CREATE TABLE IF NOT EXISTS {this._turnsTable} (
@@ -118,8 +137,7 @@ internal sealed partial class PostgresMemoryStore : IPostgresMemoryStore
                 ON {this._memoriesTable} (application_id, agent_id, user_id, memory_type, content_hash);
             CREATE INDEX IF NOT EXISTS ix_{this._baseTableName}_memories_tsv
                 ON {this._memoriesTable} USING gin (content_tsv);
-            CREATE INDEX IF NOT EXISTS ix_{this._baseTableName}_memories_embedding
-                ON {this._memoriesTable} USING hnsw (embedding vector_cosine_ops);
+            {memoryVectorIndexSql}
 
             CREATE TABLE IF NOT EXISTS {this._summariesTable} (
                 id BIGSERIAL PRIMARY KEY,
@@ -167,6 +185,25 @@ internal sealed partial class PostgresMemoryStore : IPostgresMemoryStore
                 throw;
             }
         }
+    }
+
+    internal string GetVectorIndexSql(string table, string hnswIndexName, string diskAnnIndexName)
+    {
+        var hnswIndex = this.Qualify(hnswIndexName);
+        var diskAnnIndex = this.Qualify(diskAnnIndexName);
+
+        return this._vectorIndexKind switch
+        {
+            PostgresMemoryVectorIndexKind.Hnsw => $"""
+                DROP INDEX IF EXISTS {diskAnnIndex};
+                CREATE INDEX IF NOT EXISTS {hnswIndexName} ON {table} USING hnsw (embedding vector_cosine_ops);
+                """,
+            PostgresMemoryVectorIndexKind.DiskAnn => $"""
+                DROP INDEX IF EXISTS {hnswIndex};
+                CREATE INDEX IF NOT EXISTS {diskAnnIndexName} ON {table} USING diskann (embedding vector_cosine_ops);
+                """,
+            _ => throw new InvalidOperationException("The vector index kind is not supported."),
+        };
     }
 
     public async Task<long> InsertTurnAsync(
@@ -500,6 +537,58 @@ internal sealed partial class PostgresMemoryStore : IPostgresMemoryStore
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
                     results.Add(ReadDerivedMemory(reader, scoreOrdinal: 15));
+                }
+            }
+
+            return results;
+        }
+    }
+
+    public async Task<IReadOnlyList<PostgresMemoryRerankResult>> RerankAsync(
+        string searchTerms,
+        IReadOnlyList<PostgresMemoryRecord> candidates,
+        string model,
+        CancellationToken cancellationToken)
+    {
+        if (candidates.Count == 0)
+        {
+            return [];
+        }
+
+        const string Sql = """
+            SELECT document_id, rank, relevance_score
+            FROM azure_ai.rank(
+                query => @query_text,
+                document_contents => @document_contents,
+                document_ids => @document_ids,
+                model => @model)
+            ORDER BY rank;
+            """;
+
+        var command = this._dataSource.CreateCommand(Sql);
+        await using (command.ConfigureAwait(false))
+        {
+            command.Parameters.AddWithValue("query_text", NpgsqlDbType.Text, searchTerms);
+            command.Parameters.AddWithValue(
+                "document_contents",
+                NpgsqlDbType.Array | NpgsqlDbType.Text,
+                candidates.Select(candidate => candidate.Content).ToArray());
+            command.Parameters.AddWithValue(
+                "document_ids",
+                NpgsqlDbType.Array | NpgsqlDbType.Text,
+                candidates.Select(candidate => candidate.Id.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToArray());
+            command.Parameters.AddWithValue("model", NpgsqlDbType.Text, model);
+
+            var results = new List<PostgresMemoryRerankResult>(candidates.Count);
+            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using (reader.ConfigureAwait(false))
+            {
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    var id = long.Parse(reader.GetString(0), System.Globalization.CultureInfo.InvariantCulture);
+                    var rank = Convert.ToInt32(reader.GetValue(1), System.Globalization.CultureInfo.InvariantCulture);
+                    var relevanceScore = Convert.ToDouble(reader.GetValue(2), System.Globalization.CultureInfo.InvariantCulture);
+                    results.Add(new PostgresMemoryRerankResult(id, rank, relevanceScore));
                 }
             }
 

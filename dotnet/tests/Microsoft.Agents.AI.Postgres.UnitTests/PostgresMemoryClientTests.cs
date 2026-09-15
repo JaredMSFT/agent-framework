@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
 using Moq;
+using Npgsql;
 
 namespace Microsoft.Agents.AI.Postgres.UnitTests;
 
@@ -104,6 +105,91 @@ public sealed class PostgresMemoryClientTests
                 It.IsAny<EmbeddingGenerationOptions>(),
                 It.IsAny<CancellationToken>()),
             Times.Once);
+    }
+
+    [Fact]
+    public async Task SearchAsync_ReranksExpandedCandidatePoolAsync()
+    {
+        // Arrange
+        var first = CreateRecord(1, PostgresMemoryType.Fact, "PostgreSQL tuning guidance.");
+        var second = CreateRecord(2, PostgresMemoryType.Fact, "The user prefers PostgreSQL.");
+        var third = CreateRecord(3, PostgresMemoryType.Fact, "A MySQL migration occurred.");
+        this._store
+            .Setup(store => store.SearchAsync(
+                It.IsAny<PostgresMemoryScope>(),
+                "preferred database",
+                s_embedding,
+                It.IsAny<IReadOnlyList<PostgresMemoryType>>(),
+                25,
+                0.7,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync([first, second, third]);
+        this._store
+            .Setup(store => store.RerankAsync(
+                "preferred database",
+                It.IsAny<IReadOnlyList<PostgresMemoryRecord>>(),
+                "cohere-rerank-v3.5",
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(
+            [
+                new PostgresMemoryRerankResult(2, 1, 0.98),
+                new PostgresMemoryRerankResult(1, 2, 0.63),
+                new PostgresMemoryRerankResult(3, 3, 0.12),
+            ]);
+        var client = this.CreateClient(new PostgresMemoryClientOptions
+        {
+            AutoProcess = false,
+            EnableAzureAiReranking = true,
+        });
+
+        // Act
+        var results = await client.SearchAsync(CreateScope(), "preferred database", topK: 2);
+
+        // Assert
+        Assert.Equal([2L, 1L], results.Select(result => result.Id));
+        Assert.Equal(0.98, results[0].RerankerScore);
+        Assert.Equal(0.63, results[1].RerankerScore);
+    }
+
+    [Fact]
+    public async Task SearchAsync_WhenRerankingFails_ReturnsHybridOrderAsync()
+    {
+        // Arrange
+        var candidates = new[]
+        {
+            CreateRecord(1, PostgresMemoryType.Fact, "First hybrid result."),
+            CreateRecord(2, PostgresMemoryType.Fact, "Second hybrid result."),
+            CreateRecord(3, PostgresMemoryType.Fact, "Third hybrid result."),
+        };
+        this._store
+            .Setup(store => store.SearchAsync(
+                It.IsAny<PostgresMemoryScope>(),
+                It.IsAny<string>(),
+                It.IsAny<ReadOnlyMemory<float>>(),
+                It.IsAny<IReadOnlyList<PostgresMemoryType>>(),
+                It.IsAny<int>(),
+                It.IsAny<double>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(candidates);
+        this._store
+            .Setup(store => store.RerankAsync(
+                It.IsAny<string>(),
+                It.IsAny<IReadOnlyList<PostgresMemoryRecord>>(),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NpgsqlException("Reranker unavailable."));
+        var client = this.CreateClient(new PostgresMemoryClientOptions
+        {
+            AutoProcess = false,
+            EnableAzureAiReranking = true,
+        });
+
+        // Act
+        var results = await client.SearchAsync(CreateScope(), "database", topK: 2);
+
+        // Assert
+        Assert.Equal([1L, 2L], results.Select(result => result.Id));
+        Assert.All(results, result => Assert.Null(result.RerankerScore));
     }
 
     [Fact]

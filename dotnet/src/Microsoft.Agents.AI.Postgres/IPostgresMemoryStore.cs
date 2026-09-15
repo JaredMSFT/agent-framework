@@ -72,6 +72,12 @@ internal interface IPostgresMemoryStore
         double minConfidence,
         CancellationToken cancellationToken);
 
+    Task<IReadOnlyList<PostgresMemoryRerankResult>> RerankAsync(
+        string searchTerms,
+        IReadOnlyList<PostgresMemoryRecord> candidates,
+        string model,
+        CancellationToken cancellationToken);
+
     Task MarkSupersededAsync(
         long supersededId,
         long winnerId,
@@ -103,3 +109,5 @@ internal interface IPostgresMemoryStore
         ProcessingState state,
         CancellationToken cancellationToken);
 }
+
+internal sealed record PostgresMemoryRerankResult(long Id, int Rank, double RelevanceScore);

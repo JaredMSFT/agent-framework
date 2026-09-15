@@ -188,14 +188,69 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
 
         await this.EnsureSchemaAsync(cancellationToken).ConfigureAwait(false);
         var embedding = await this._embeddingGenerator.GenerateVectorAsync(searchTerms, cancellationToken: cancellationToken).ConfigureAwait(false);
-        return await this._store.SearchAsync(
+        var candidateCount = this._options.EnableAzureAiReranking
+            ? Math.Max(topK, this._options.RerankingCandidateCount)
+            : topK;
+        var candidates = await this._store.SearchAsync(
             scope,
             searchTerms,
             embedding,
             selectedTypes,
-            topK,
+            candidateCount,
             minConfidence,
             cancellationToken).ConfigureAwait(false);
+
+        if (!this._options.EnableAzureAiReranking || candidates.Count <= 1)
+        {
+            return candidates;
+        }
+
+        try
+        {
+            var reranked = await this._store.RerankAsync(
+                searchTerms,
+                candidates,
+                this._options.AzureAiRerankerModel,
+                cancellationToken).ConfigureAwait(false);
+            var candidatesById = candidates.ToDictionary(candidate => candidate.Id);
+            var results = new List<PostgresMemoryRecord>(topK);
+            var selectedIds = new HashSet<long>();
+
+            foreach (var result in reranked.OrderBy(result => result.Rank))
+            {
+                if (candidatesById.TryGetValue(result.Id, out var candidate) && selectedIds.Add(result.Id))
+                {
+                    results.Add(candidate.WithRerankerScore(result.RelevanceScore));
+                    if (results.Count == topK)
+                    {
+                        return results;
+                    }
+                }
+            }
+
+            foreach (var candidate in candidates)
+            {
+                if (selectedIds.Add(candidate.Id))
+                {
+                    results.Add(candidate);
+                    if (results.Count == topK)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            return results;
+        }
+        catch (NpgsqlException ex)
+        {
+            if (this._logger?.IsEnabled(LogLevel.Warning) is true)
+            {
+                this._logger.LogWarning(ex, "Azure AI memory reranking failed; returning hybrid retrieval order.");
+            }
+
+            return candidates.Take(topK).ToArray();
+        }
     }
 
     /// <summary>
@@ -933,7 +988,17 @@ public sealed class PostgresMemoryClient : IPostgresMemoryClient, IAsyncDisposab
         {
             throw new ArgumentOutOfRangeException(
                 nameof(options),
-                "EmbeddingDimensions must be between 1 and 2000 for a pgvector vector HNSW index.");
+                "EmbeddingDimensions must be between 1 and 2000 for the vector index.");
+        }
+
+        if (options.RerankingCandidateCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "RerankingCandidateCount must be greater than zero.");
+        }
+
+        if (options.EnableAzureAiReranking && string.IsNullOrWhiteSpace(options.AzureAiRerankerModel))
+        {
+            throw new ArgumentException("AzureAiRerankerModel is required when Azure AI reranking is enabled.", nameof(options));
         }
 
         if (options.FactExtractionEveryNTurns < 0

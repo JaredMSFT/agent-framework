@@ -66,6 +66,11 @@ public sealed class PostgresMemoryRecord
     public double? Score { get; init; }
 
     /// <summary>
+    /// Gets the semantic relevance score returned by an optional second-stage reranker.
+    /// </summary>
+    public double? RerankerScore { get; init; }
+
+    /// <summary>
     /// Gets the tags associated with the memory.
     /// </summary>
     public IReadOnlyList<string> Tags { get; init; } = [];
@@ -94,4 +99,27 @@ public sealed class PostgresMemoryRecord
     /// Gets the reason this record was superseded, when applicable.
     /// </summary>
     public string? SupersedeReason { get; init; }
+
+    internal PostgresMemoryRecord WithRerankerScore(double rerankerScore) =>
+        new()
+        {
+            Id = this.Id,
+            MemoryType = this.MemoryType,
+            Content = this.Content,
+            Role = this.Role,
+            UserId = this.UserId,
+            ThreadId = this.ThreadId,
+            AgentId = this.AgentId,
+            ApplicationId = this.ApplicationId,
+            Confidence = this.Confidence,
+            Salience = this.Salience,
+            Score = this.Score,
+            RerankerScore = rerankerScore,
+            Tags = this.Tags,
+            CreatedAt = this.CreatedAt,
+            UpdatedAt = this.UpdatedAt,
+            IsSuperseded = this.IsSuperseded,
+            SupersededBy = this.SupersededBy,
+            SupersedeReason = this.SupersedeReason,
+        };
 }

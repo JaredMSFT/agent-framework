@@ -12,13 +12,14 @@ This sample uses `PostgresMemoryClient` and `PostgresMemoryContextProvider` to d
 - Reconciling a changed preference while preserving supersession history
 - Running the processing pipeline explicitly with `ProcessNowAsync`
 - Using automatic background processing with `FlushAsync` in a smaller getting-started mode
+- Using DiskANN and `azure_ai.rank()` on Azure Database for PostgreSQL flexible server
 
 ## Prerequisites
 
 1. [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 2. A Microsoft Foundry project with:
    - A chat model deployment (the default is `gpt-5.4-mini`)
-   - A `text-embedding-3-large` deployment with 3,072 dimensions
+   - A `text-embedding-3-small` deployment with 1,536 dimensions
 3. A PostgreSQL database with the [pgvector extension](https://github.com/pgvector/pgvector) available
 4. A database role that can create the configured schema, tables, indexes, and the `vector` extension if it is not already installed
 5. Azure CLI authentication (`az login`)
@@ -32,15 +33,39 @@ Set the following environment variables:
 | `FOUNDRY_PROJECT_ENDPOINT` | Microsoft Foundry project endpoint | *(required)* |
 | `POSTGRES_MEMORY_CONNECTION_STRING` | Npgsql connection string for the memory database | *(required)* |
 | `FOUNDRY_MODEL` | Chat model deployment name | `gpt-5.4-mini` |
-| `FOUNDRY_EMBEDDING_MODEL` | Embedding model deployment name | `text-embedding-3-large` |
-| `FOUNDRY_EMBEDDING_DIMENSIONS` | Number of dimensions produced by the embedding deployment | `3072` |
+| `FOUNDRY_EMBEDDING_MODEL` | Embedding model deployment name | `text-embedding-3-small` |
+| `FOUNDRY_EMBEDDING_DIMENSIONS` | Number of dimensions produced by the embedding deployment | `1536` |
+| `FOUNDRY_RERANKER_MODEL` | Foundry reranker deployment name used by the Azure demo | `cohere-rerank-v3.5` |
+
+### Embedding Model Dimensions
+
+The embedding model and vector dimensions are a pair:
+
+| Model | Default dimensions | Supported by this sample |
+|---|---:|---|
+| `text-embedding-3-small` | 1,536 | Yes (the default) |
+| `text-embedding-3-large` | 3,072 | Not at its default size; `PostgresMemoryClient` currently supports up to 2,000 dimensions |
+
+`FOUNDRY_EMBEDDING_DIMENSIONS` defines the PostgreSQL vector column size; it does not change the
+number of dimensions returned by the embedding deployment. Its value must match the actual embedding
+output. The sample therefore defaults to `text-embedding-3-small` with `1536`. Using the native
+3,072-dimensional output from `text-embedding-3-large` requires future support for larger vectors
+(such as DiskANN product quantization) in `PostgresMemoryClient`.
 
 ## Run the Sample
 
-Run the comprehensive walkthrough:
+Run the smaller background-processing walkthrough:
 
 ```bash
 dotnet run
+```
+
+### Advanced Memory Pipeline Demo
+
+Run the comprehensive memory-processing walkthrough:
+
+```bash
+dotnet run -- --advanced
 ```
 
 The walkthrough deliberately exercises all four PostgreSQL tables:
@@ -52,12 +77,23 @@ The walkthrough deliberately exercises all four PostgreSQL tables:
 
 The sample prints the stored turns, active typed memories, summaries, and reconciliation count. Memory extraction and reconciliation use model output, so the exact records and wording can vary between runs.
 
-### Simple Background-Processing Demo
+### Azure DiskANN and Semantic Reranking Demo
 
-For a smaller getting-started example, run:
+This mode requires Azure Database for PostgreSQL flexible server. Allowlist `vector`, `pg_diskann`,
+and `azure_ai` in the server's `azure.extensions` parameter. Deploy the configured reranker model in
+Microsoft Foundry and configure `azure_ai` to access its reranking endpoint. Managed identity is
+recommended; the server identity needs the `Azure Machine Learning Data Scientist` role on the
+Foundry resource.
+
+Run the Azure-specific walkthrough:
 
 ```bash
-dotnet run -- --simple
+dotnet run -- --azure
 ```
 
-This mode uses the provider constructor that owns its `PostgresMemoryClient`. The first session stores an elephant preference and schedules extraction automatically. `FlushAsync` waits for that background work before a second session asks for a suitable joke.
+The walkthrough creates a DiskANN index, prints its PostgreSQL definition, and stores several
+similar memories. It then prints the same search first in hybrid reciprocal-rank-fusion order and
+again after `azure_ai.rank()` semantic reranking so the two scores and ordering can be compared.
+
+Both `pg_diskann` and the `azure_ai.rank()` AI function are preview features. Availability depends
+on the Azure region and PostgreSQL version.

@@ -5,6 +5,22 @@ using System;
 namespace Microsoft.Agents.AI.Postgres;
 
 /// <summary>
+/// Specifies the approximate nearest neighbor index used for memory embeddings.
+/// </summary>
+public enum PostgresMemoryVectorIndexKind
+{
+    /// <summary>
+    /// Uses the pgvector Hierarchical Navigable Small Worlds index.
+    /// </summary>
+    Hnsw,
+
+    /// <summary>
+    /// Uses the pg_diskann DiskANN index available in Azure Database for PostgreSQL flexible server.
+    /// </summary>
+    DiskAnn,
+}
+
+/// <summary>
 /// Configures storage, retrieval, and processing behavior for <see cref="PostgresMemoryClient"/>.
 /// </summary>
 public sealed class PostgresMemoryClientOptions
@@ -31,9 +47,30 @@ public sealed class PostgresMemoryClientOptions
     public int EmbeddingDimensions { get; set; } = 1536;
 
     /// <summary>
+    /// Gets or sets the approximate nearest neighbor index used for memory embeddings.
+    /// </summary>
+    public PostgresMemoryVectorIndexKind VectorIndexKind { get; set; } = PostgresMemoryVectorIndexKind.Hnsw;
+
+    /// <summary>
     /// Gets or sets the Reciprocal Rank Fusion constant used by hybrid retrieval.
     /// </summary>
     public int ReciprocalRankFusionK { get; set; } = 60;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether hybrid search candidates are reranked with
+    /// <c>azure_ai.rank()</c> before results are returned.
+    /// </summary>
+    public bool EnableAzureAiReranking { get; set; }
+
+    /// <summary>
+    /// Gets or sets the Foundry model deployment used by <c>azure_ai.rank()</c>.
+    /// </summary>
+    public string AzureAiRerankerModel { get; set; } = "cohere-rerank-v3.5";
+
+    /// <summary>
+    /// Gets or sets the maximum number of hybrid search candidates sent to the reranker.
+    /// </summary>
+    public int RerankingCandidateCount { get; set; } = 25;
 
     /// <summary>
     /// Gets or sets a value indicating whether raw conversation turns are embedded.
