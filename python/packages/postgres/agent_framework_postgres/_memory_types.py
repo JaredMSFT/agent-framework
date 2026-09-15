@@ -19,6 +19,13 @@ class PostgresMemoryType(str, Enum):
     USER_SUMMARY = "user_summary"
 
 
+class PostgresMemoryVectorIndexKind(str, Enum):
+    """Approximate nearest-neighbor index used for memory embeddings."""
+
+    HNSW = "hnsw"
+    DISK_ANN = "disk_ann"
+
+
 _DERIVED_MEMORY_TYPES = frozenset({
     PostgresMemoryType.FACT,
     PostgresMemoryType.PROCEDURAL,
@@ -98,6 +105,7 @@ class PostgresMemoryRecord:
     is_superseded: bool = False
     superseded_by: int | None = None
     supersede_reason: str | None = None
+    reranker_score: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +150,11 @@ class PostgresMemoryClientOptions:
     table_name: str = "agent_memories"
     ensure_schema_on_first_use: bool = True
     embedding_dimensions: int = 1536
+    vector_index_kind: PostgresMemoryVectorIndexKind = PostgresMemoryVectorIndexKind.HNSW
     reciprocal_rank_fusion_k: int = 60
+    enable_azure_ai_reranking: bool = False
+    azure_ai_reranker_model: str = "cohere-rerank-v3.5"
+    reranking_candidate_count: int = 25
     enable_turn_embeddings: bool = False
     auto_process: bool = True
     fact_extraction_every_n_turns: int = 2
@@ -156,9 +168,15 @@ class PostgresMemoryClientOptions:
 
     def __post_init__(self) -> None:
         if not 1 <= self.embedding_dimensions <= 2000:
-            raise ValueError("embedding_dimensions must be between 1 and 2000 for a pgvector HNSW index.")
+            raise ValueError("embedding_dimensions must be between 1 and 2000 for the vector index.")
+        if not isinstance(self.vector_index_kind, PostgresMemoryVectorIndexKind):
+            raise ValueError("vector_index_kind must be a PostgresMemoryVectorIndexKind value.")
         if self.reciprocal_rank_fusion_k <= 0:
             raise ValueError("reciprocal_rank_fusion_k must be greater than zero.")
+        if self.reranking_candidate_count <= 0:
+            raise ValueError("reranking_candidate_count must be greater than zero.")
+        if self.enable_azure_ai_reranking and not self.azure_ai_reranker_model.strip():
+            raise ValueError("azure_ai_reranker_model is required when Azure AI reranking is enabled.")
         cadence = (
             self.fact_extraction_every_n_turns,
             self.reconcile_every_n_extractions,

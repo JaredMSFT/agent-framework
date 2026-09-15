@@ -12,7 +12,13 @@ from pgvector import Vector as PgVector
 from psycopg import sql
 from psycopg.rows import tuple_row
 
-from ._memory_types import PostgresMemoryClientOptions, PostgresMemoryRecord, PostgresMemoryScope, PostgresMemoryType
+from ._memory_types import (
+    PostgresMemoryClientOptions,
+    PostgresMemoryRecord,
+    PostgresMemoryScope,
+    PostgresMemoryType,
+    PostgresMemoryVectorIndexKind,
+)
 from ._vector_store import _Client, _prepare_identifier  # pyright: ignore[reportPrivateUsage]
 
 _STRICT_USER_SCOPE = sql.SQL(
@@ -38,6 +44,13 @@ class _ProcessingState:
     summary_through_turn_id: int = 0
     user_summary_through_turn_id: int = 0
     extraction_runs: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _PostgresMemoryRerankResult:
+    id: int
+    rank: int
+    relevance_score: float
 
 
 class _PostgresMemoryStore:  # pyright: ignore[reportUnusedClass]
@@ -70,6 +83,11 @@ class _PostgresMemoryStore:  # pyright: ignore[reportUnusedClass]
     async def _ensure_schema_core(self) -> None:
         dimension = sql.Literal(self._options.embedding_dimensions)
         base = self._options.table_name
+        memory_vector_indexes = self._get_vector_index_statements(
+            self._memories,
+            f"ix_{base}_memories_embedding",
+            f"ix_{base}_memories_diskann",
+        )
         statements: list[sql.Composed] = [
             sql.SQL(
                 """
@@ -123,9 +141,7 @@ class _PostgresMemoryStore:  # pyright: ignore[reportUnusedClass]
             sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} USING gin (content_tsv)").format(
                 _prepare_identifier(f"ix_{base}_memories_tsv"), self._memories
             ),
-            sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw (embedding vector_cosine_ops)").format(
-                _prepare_identifier(f"ix_{base}_memories_embedding"), self._memories
-            ),
+            *memory_vector_indexes,
             sql.SQL(
                 """
                 CREATE TABLE IF NOT EXISTS {} (
@@ -162,15 +178,38 @@ class _PostgresMemoryStore:  # pyright: ignore[reportUnusedClass]
             ).format(self._processing),
         ]
         if self._options.enable_turn_embeddings:
-            statements.insert(
-                2,
-                sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw (embedding vector_cosine_ops)").format(
-                    _prepare_identifier(f"ix_{base}_turns_embedding"), self._turns
-                ),
+            statements[2:2] = self._get_vector_index_statements(
+                self._turns,
+                f"ix_{base}_turns_embedding",
+                f"ix_{base}_turns_diskann",
             )
         async with self._client.connection(vectors=True) as connection:
             for statement in statements:
                 await connection.execute(statement)
+
+    def _get_vector_index_statements(
+        self,
+        table: sql.Identifier,
+        hnsw_index_name: str,
+        disk_ann_index_name: str,
+    ) -> list[sql.Composed]:
+        hnsw_index = sql.Identifier(self._options.schema, hnsw_index_name)
+        disk_ann_index = sql.Identifier(self._options.schema, disk_ann_index_name)
+        if self._options.vector_index_kind is PostgresMemoryVectorIndexKind.HNSW:
+            return [
+                sql.SQL("DROP INDEX IF EXISTS {}").format(disk_ann_index),
+                sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw (embedding vector_cosine_ops)").format(
+                    _prepare_identifier(hnsw_index_name), table
+                ),
+            ]
+        if self._options.vector_index_kind is PostgresMemoryVectorIndexKind.DISK_ANN:
+            return [
+                sql.SQL("DROP INDEX IF EXISTS {}").format(hnsw_index),
+                sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} USING diskann (embedding vector_cosine_ops)").format(
+                    _prepare_identifier(disk_ann_index_name), table
+                ),
+            ]
+        raise ValueError("Unsupported memory vector index kind.")
 
     async def insert_turn(
         self,
@@ -452,6 +491,39 @@ class _PostgresMemoryStore:  # pyright: ignore[reportUnusedClass]
             await cursor.execute(statement, params)
             rows = await cursor.fetchall()
         return [self._read_derived_memory(row, score_index=15) for row in rows]
+
+    async def rerank(
+        self,
+        search_terms: str,
+        candidates: list[PostgresMemoryRecord],
+        model: str,
+    ) -> list[_PostgresMemoryRerankResult]:
+        if not candidates:
+            return []
+        statement = sql.SQL(
+            """
+            SELECT document_id, rank, relevance_score
+            FROM azure_ai.rank(
+                query => %s,
+                document_contents => %s::text[],
+                document_ids => %s::text[],
+                model => %s)
+            ORDER BY rank
+            """
+        )
+        params = [
+            search_terms,
+            [candidate.content for candidate in candidates],
+            [str(candidate.id) for candidate in candidates],
+            model,
+        ]
+        async with self._client.connection() as connection, connection.cursor(row_factory=tuple_row) as cursor:
+            await cursor.execute(statement, params)
+            rows = await cursor.fetchall()
+        return [
+            _PostgresMemoryRerankResult(id=int(row[0]), rank=int(row[1]), relevance_score=float(row[2]))
+            for row in rows
+        ]
 
     async def mark_superseded(self, superseded_id: int, winner_id: int, reason: str) -> bool:
         statement = sql.SQL(

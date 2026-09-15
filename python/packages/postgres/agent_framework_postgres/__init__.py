@@ -15,6 +15,7 @@ from ._memory_types import (
     PostgresMemoryRecord,
     PostgresMemoryScope,
     PostgresMemoryType,
+    PostgresMemoryVectorIndexKind,
 )
 from ._vector_store import PostgresCollection, PostgresSettings, PostgresStore
 
@@ -33,6 +34,7 @@ __all__ = [
     "PostgresMemoryRecord",
     "PostgresMemoryScope",
     "PostgresMemoryType",
+    "PostgresMemoryVectorIndexKind",
     "PostgresSettings",
     "PostgresStore",
     "__version__",

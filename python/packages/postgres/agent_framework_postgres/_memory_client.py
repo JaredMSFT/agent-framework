@@ -20,7 +20,7 @@ from agent_framework import (
 )
 from agent_framework._telemetry import mark_feature_used
 from agent_framework.exceptions import IntegrationInvalidResponseException
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, Error
 
 from ._feature_usage import FeatureIndex
 from ._memory_store import _PostgresMemoryStore  # pyright: ignore[reportPrivateUsage]
@@ -187,14 +187,48 @@ class PostgresMemoryClient:
         selected_types = _validate_retrieval_arguments(memory_types, top_k, min_confidence)
         await self._ensure_schema_if_enabled()
         embedding = await self._generate_embedding(normalized_terms)
-        return await self._store.search(
+        candidate_count = (
+            max(top_k, self.options.reranking_candidate_count) if self.options.enable_azure_ai_reranking else top_k
+        )
+        candidates = await self._store.search(
             scope,
             normalized_terms,
             embedding,
             selected_types,
-            top_k,
+            candidate_count,
             min_confidence,
         )
+        if not self.options.enable_azure_ai_reranking or len(candidates) <= 1:
+            return candidates
+
+        try:
+            reranked = await self._store.rerank(
+                normalized_terms,
+                candidates,
+                self.options.azure_ai_reranker_model,
+            )
+        except Error:
+            logger.warning("Azure AI memory reranking failed; returning hybrid retrieval order.", exc_info=True)
+            return candidates[:top_k]
+
+        candidates_by_id = {candidate.id: candidate for candidate in candidates}
+        selected_ids: set[int] = set()
+        results: list[PostgresMemoryRecord] = []
+        for rerank_result in sorted(reranked, key=lambda result: result.rank):
+            candidate = candidates_by_id.get(rerank_result.id)
+            if candidate is not None and candidate.id not in selected_ids:
+                selected_ids.add(candidate.id)
+                results.append(replace(candidate, reranker_score=rerank_result.relevance_score))
+                if len(results) == top_k:
+                    return results
+
+        for candidate in candidates:
+            if candidate.id not in selected_ids:
+                selected_ids.add(candidate.id)
+                results.append(candidate)
+                if len(results) == top_k:
+                    break
+        return results
 
     async def get_user_summary(self, scope: PostgresMemoryScope) -> PostgresMemoryRecord | None:
         """Get the latest cross-thread user summary."""

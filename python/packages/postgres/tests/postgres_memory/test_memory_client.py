@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from agent_framework import ChatResponse, Embedding, GeneratedEmbeddings, Message
 from agent_framework.exceptions import IntegrationInvalidResponseException
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, Error
 
 from agent_framework_postgres import (
     PostgresMemoryClient,
@@ -19,8 +19,13 @@ from agent_framework_postgres import (
     PostgresMemoryRecord,
     PostgresMemoryScope,
     PostgresMemoryType,
+    PostgresMemoryVectorIndexKind,
 )
-from agent_framework_postgres._memory_store import _PostgresMemoryStore, _ProcessingState
+from agent_framework_postgres._memory_store import (
+    _PostgresMemoryRerankResult,
+    _PostgresMemoryStore,
+    _ProcessingState,
+)
 
 
 class _EmbeddingClient:
@@ -62,17 +67,32 @@ def _turn(turn_id: int, role: str, content: str) -> PostgresMemoryRecord:
     )
 
 
+def _memory(memory_id: int, content: str, *, score: float | None = None) -> PostgresMemoryRecord:
+    now = datetime.now(timezone.utc)
+    return PostgresMemoryRecord(
+        id=memory_id,
+        memory_type=PostgresMemoryType.FACT,
+        content=content,
+        user_id="user-1",
+        confidence=0.9,
+        score=score,
+        created_at=now,
+        updated_at=now,
+    )
+
+
 def _create_client(
     store: MagicMock,
     chat_client: _ChatClient,
     *,
     embedding_client: _EmbeddingClient | None = None,
+    options: PostgresMemoryClientOptions | None = None,
 ) -> PostgresMemoryClient:
     client = PostgresMemoryClient(
         embedding_generator=cast(Any, embedding_client or _EmbeddingClient()),
         chat_client=cast(Any, chat_client),
         client=MagicMock(spec=AsyncConnection),
-        options=PostgresMemoryClientOptions(embedding_dimensions=3, auto_process=False),
+        options=options or PostgresMemoryClientOptions(embedding_dimensions=3, auto_process=False),
     )
     client._store = store
     return client
@@ -88,6 +108,7 @@ def _store() -> MagicMock:
     store.insert_derived_memory = AsyncMock(return_value=10)
     store.upsert_processing_state = AsyncMock()
     store.search = AsyncMock(return_value=[])
+    store.rerank = AsyncMock(return_value=[])
     store.compute_scope_key = MagicMock(return_value="scope-key")
     return store
 
@@ -111,8 +132,123 @@ def test_scope_and_options_validate_identity_and_dimensions() -> None:
         PostgresMemoryScope(user_id=" ")
     with pytest.raises(ValueError, match="embedding_dimensions"):
         PostgresMemoryClientOptions(embedding_dimensions=2001)
+    with pytest.raises(ValueError, match="vector_index_kind"):
+        PostgresMemoryClientOptions(vector_index_kind=cast(Any, "disk_ann"))
+    with pytest.raises(ValueError, match="reranking_candidate_count"):
+        PostgresMemoryClientOptions(reranking_candidate_count=0)
+    with pytest.raises(ValueError, match="azure_ai_reranker_model"):
+        PostgresMemoryClientOptions(enable_azure_ai_reranking=True, azure_ai_reranker_model=" ")
     with pytest.raises(ValueError, match="dedupe"):
         PostgresMemoryClientOptions(dedupe_similarity_threshold=float("nan"))
+
+
+@pytest.mark.parametrize(
+    ("index_kind", "created_kind", "dropped_name"),
+    [
+        (PostgresMemoryVectorIndexKind.HNSW, "hnsw", "ix_memory_memories_diskann"),
+        (PostgresMemoryVectorIndexKind.DISK_ANN, "diskann", "ix_memory_memories_embedding"),
+    ],
+)
+def test_memory_vector_index_sql_replaces_the_other_managed_index(
+    index_kind: PostgresMemoryVectorIndexKind,
+    created_kind: str,
+    dropped_name: str,
+) -> None:
+    options = PostgresMemoryClientOptions(
+        table_name="memory",
+        embedding_dimensions=3,
+        vector_index_kind=index_kind,
+        auto_process=False,
+    )
+    store = _PostgresMemoryStore(MagicMock(), options)
+
+    statements = store._get_vector_index_statements(
+        store._memories,
+        "ix_memory_memories_embedding",
+        "ix_memory_memories_diskann",
+    )
+    rendered = [statement.as_string() for statement in statements]
+
+    assert dropped_name in rendered[0]
+    assert f"USING {created_kind}" in rendered[1]
+
+
+async def test_search_reranks_expanded_candidate_pool() -> None:
+    store = _store()
+    candidates = [
+        _memory(1, "PostgreSQL tuning guidance.", score=0.03),
+        _memory(2, "The user prefers PostgreSQL.", score=0.02),
+        _memory(3, "A MySQL migration occurred.", score=0.01),
+    ]
+    store.search.return_value = candidates
+    store.rerank.return_value = [
+        _PostgresMemoryRerankResult(id=2, rank=1, relevance_score=0.98),
+        _PostgresMemoryRerankResult(id=1, rank=2, relevance_score=0.63),
+        _PostgresMemoryRerankResult(id=3, rank=3, relevance_score=0.12),
+    ]
+    options = PostgresMemoryClientOptions(
+        embedding_dimensions=3,
+        enable_azure_ai_reranking=True,
+        auto_process=False,
+    )
+    client = _create_client(store, _ChatClient(), options=options)
+
+    results = await client.search(PostgresMemoryScope(user_id="user-1"), "preferred database", top_k=2)
+
+    assert [result.id for result in results] == [2, 1]
+    assert [result.reranker_score for result in results] == [0.98, 0.63]
+    assert [result.score for result in results] == [0.02, 0.03]
+    assert store.search.await_args.args[4] == 25
+    store.rerank.assert_awaited_once_with("preferred database", candidates, "cohere-rerank-v3.5")
+
+
+async def test_search_returns_hybrid_order_when_reranking_fails() -> None:
+    store = _store()
+    candidates = [
+        _memory(1, "First hybrid result."),
+        _memory(2, "Second hybrid result."),
+        _memory(3, "Third hybrid result."),
+    ]
+    store.search.return_value = candidates
+    store.rerank.side_effect = Error("Reranker unavailable.")
+    options = PostgresMemoryClientOptions(
+        embedding_dimensions=3,
+        enable_azure_ai_reranking=True,
+        auto_process=False,
+    )
+    client = _create_client(store, _ChatClient(), options=options)
+
+    results = await client.search(PostgresMemoryScope(user_id="user-1"), "database", top_k=2)
+
+    assert [result.id for result in results] == [1, 2]
+    assert all(result.reranker_score is None for result in results)
+
+
+async def test_store_rerank_batches_candidates_in_one_database_call() -> None:
+    client = MagicMock()
+    connection = MagicMock()
+    cursor = MagicMock()
+    cursor.execute = AsyncMock()
+    cursor.fetchall = AsyncMock(return_value=[("2", 1, 0.98), ("1", 2, 0.63)])
+    connection.cursor.return_value.__aenter__ = AsyncMock(return_value=cursor)
+    connection.cursor.return_value.__aexit__ = AsyncMock(return_value=None)
+    client.connection.return_value.__aenter__ = AsyncMock(return_value=connection)
+    client.connection.return_value.__aexit__ = AsyncMock(return_value=None)
+    store = _PostgresMemoryStore(
+        client,
+        PostgresMemoryClientOptions(embedding_dimensions=3, auto_process=False),
+    )
+    candidates = [_memory(1, "First"), _memory(2, "Second")]
+
+    results = await store.rerank("preferred database", candidates, "cohere-rerank-v3.5")
+
+    assert [(result.id, result.rank, result.relevance_score) for result in results] == [
+        (2, 1, 0.98),
+        (1, 2, 0.63),
+    ]
+    params = cursor.execute.await_args.args[1]
+    assert params == ["preferred database", ["First", "Second"], ["1", "2"], "cohere-rerank-v3.5"]
+    cursor.execute.assert_awaited_once()
 
 
 async def test_extract_memories_inserts_typed_records_and_advances_checkpoint() -> None:

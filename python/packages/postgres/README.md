@@ -117,6 +117,37 @@ retention, and all extraction and summarization prompts are configurable through
 `AsyncConnection` requires automatic processing to be disabled; use a connection string
 or `AsyncConnectionPool` for background processing.
 
+### Azure DiskANN and semantic reranking
+
+On Azure Database for PostgreSQL flexible server, memory retrieval can use the
+`pg_diskann` index and rerank the hybrid candidate set with one batched
+`azure_ai.rank()` call:
+
+```python
+from agent_framework_postgres import PostgresMemoryClientOptions, PostgresMemoryVectorIndexKind
+
+options = PostgresMemoryClientOptions(
+    embedding_dimensions=1536,
+    vector_index_kind=PostgresMemoryVectorIndexKind.DISK_ANN,
+    enable_azure_ai_reranking=True,
+    azure_ai_reranker_model="cohere-rerank-v3.5",
+    reranking_candidate_count=25,
+)
+```
+
+The database administrator must allowlist and enable `vector`, `pg_diskann`, and
+`azure_ai`; this connector does not install extensions. When reranking is enabled,
+hybrid retrieval expands to `reranking_candidate_count`, and `azure_ai.rank()` orders
+those candidates semantically. `PostgresMemoryRecord.score` retains the RRF score and
+`reranker_score` contains the semantic relevance score. If the database reranking call
+fails, retrieval returns the original hybrid order.
+
+The default HNSW index supports at most 2,000 dimensions. DiskANN supports higher
+dimensions only with product quantization in `pg_diskann` 0.6 or later; this client does
+not yet configure product quantization, so memory embeddings currently retain the
+2,000-dimension limit. Run `samples/postgres_memory.py --azure` to exercise DiskANN and
+semantic reranking with a 1,536-dimensional `text-embedding-3-small` deployment.
+
 For advanced provider integration, configure `search_input_message_filter`,
 `storage_input_request_message_filter`, and `storage_input_response_message_filter` to
 control which messages participate in retrieval and persistence. A `scope_resolver`
