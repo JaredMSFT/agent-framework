@@ -81,9 +81,62 @@ The sample prints the stored turns, active typed memories, summaries, and reconc
 
 This mode requires Azure Database for PostgreSQL flexible server. Allowlist `vector`, `pg_diskann`,
 and `azure_ai` in the server's `azure.extensions` parameter. Deploy the configured reranker model in
-Microsoft Foundry and configure `azure_ai` to access its reranking endpoint. Managed identity is
-recommended; the server identity needs the `Azure Machine Learning Data Scientist` role on the
-Foundry resource.
+Microsoft Foundry by using the Serverless API option.
+
+Before running the Azure demo, choose one of the following authentication options.
+
+#### Option 1: Cohere with an endpoint key
+
+This is the default because `FOUNDRY_RERANKER_MODEL` defaults to `cohere-rerank-v3.5`.
+
+1. Open the reranker deployment in Foundry and copy its endpoint key and **Reranker API** route.
+2. Connect to the sample database as a user that can manage `azure_ai` settings, and run:
+
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS azure_ai;
+
+      SELECT azure_ai.set_setting('azure_ml.serverless_ranking_endpoint', '<Reranker API Endpoint>');
+      SELECT azure_ai.set_setting('azure_ml.serverless_ranking_endpoint_key', '<Reranker API Key>');
+
+   SELECT azure_ai.get_setting('azure_ml.serverless_ranking_endpoint');
+   ```
+
+This option does not require a managed identity or Azure role assignment. The endpoint key is stored
+in the database's `azure_ai` settings, so do not commit or print it.
+
+#### Option 2: Azure OpenAI with managed identity
+
+Set `FOUNDRY_RERANKER_MODEL` to the name of a deployed Azure OpenAI chat model supported by
+`azure_ai.rank()`, and then:
+
+1. In the Azure portal, open the Azure Database for PostgreSQL flexible server used by
+   `POSTGRES_MEMORY_CONNECTION_STRING`. Under **Security** > **Identity**, turn the system-assigned
+   managed identity **On**, and then save the change.
+2. Open the Azure OpenAI resource that hosts the model deployment. Under **Access control (IAM)**,
+   assign the **Cognitive Services OpenAI User** role to the managed identity of the PostgreSQL
+   flexible server.
+3. Restart the PostgreSQL flexible server so that the new identity is available to `azure_ai`.
+4. Connect to the sample database as a user that can manage `azure_ai` settings, and run:
+
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS azure_ai;
+
+   SELECT azure_ai.set_setting('azure_openai.auth_type', 'managed-identity');
+   SELECT azure_ai.set_setting('azure_openai.endpoint', 'https://<azure-openai-resource-name>.openai.azure.com');
+   --OR
+   SELECT azure_ai.set_setting('azure_openai.subscription_key', '<API_KEY>');
+
+   SELECT azure_ai.get_setting('azure_openai.auth_type');
+   SELECT azure_ai.get_setting('azure_openai.endpoint');
+
+   SELECT azure_ai.set_setting('azure_ml.serverless_ranking_endpoint', '<Ranking Endpoint URL>');
+   SELECT azure_ai.set_setting('azure_ml.serverless_ranking_endpoint_key', '<Ranking Endpoint Key>');
+
+   ```
+
+The PostgreSQL administrator is a member of `azure_pg_admin`, which can manage these settings. For
+more detail, see the Microsoft Learn guides for [managed identity with `azure_ai`](https://learn.microsoft.com/azure/postgresql/azure-ai/generative-ai-enable-managed-identity-azure-ai)
+and [`azure_ai.rank()` setup](https://learn.microsoft.com/azure/postgresql/azure-ai/generative-ai-azure-ai-functions#setup-for-rank-function).
 
 Run the Azure-specific walkthrough:
 
