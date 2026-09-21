@@ -25,12 +25,13 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Microsoft.Agents.AI.Abstractions\Microsoft.Agents.AI.Abstractions.csproj" />
+    <ProjectReference Include="..\Microsoft.Agents.AI.Workflows\Microsoft.Agents.AI.Workflows.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
     <!-- NuGet Package Settings -->
     <Title>Microsoft Agent Framework - PostgreSQL integration</Title>
-    <Description>Provides a PostgreSQL and pgvector-backed ContextMemory client and context provider for Microsoft Agent Framework.</Description>
+    <Description>Provides PostgreSQL workflow checkpoints and a pgvector-backed ContextMemory client and context provider for Microsoft Agent Framework.</Description>
   </PropertyGroup>
 
   <ItemGroup>

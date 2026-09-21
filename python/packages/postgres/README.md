@@ -1,6 +1,6 @@
 # Agent Framework PostgreSQL
 
-Store vector records and durable agent memory in PostgreSQL with this alpha integration for
+Store vector records, durable agent memory, and workflow checkpoints in PostgreSQL with this alpha integration for
 [Microsoft Agent Framework](https://learn.microsoft.com/agent-framework/).
 The package uses Psycopg 3 and the official pgvector Python adapter.
 
@@ -8,6 +8,7 @@ The package uses Psycopg 3 and the official pgvector Python adapter.
 - **`PostgresStore`** creates collection clients that share a connection pool.
 - **`PostgresMemoryClient`** stores turns, extracts typed memories, maintains summaries, and performs hybrid retrieval.
 - **`PostgresMemoryContextProvider`** injects relevant memory before agent runs and stores new turns afterward.
+- **`PostgresCheckpointStorage`** persists workflow state for scoped checkpoint recovery.
 - **`PostgresSettings`** describes connection settings resolved by Agent Framework.
 
 ## Installation
@@ -16,12 +17,13 @@ The package uses Psycopg 3 and the official pgvector Python adapter.
 pip install agent-framework-postgres --pre
 ```
 
-Requires Python 3.10+, PostgreSQL 13+, and pgvector 0.8.0+.
+Requires Python 3.10+ and PostgreSQL 13+. Vector storage and memory additionally require pgvector 0.8.0+;
+checkpoint storage does not require a database extension or a model client.
 Import the connector directly from `agent_framework_postgres`.
 
 ## Connection setup
 
-Have your database administrator install and enable the `vector` extension and
+For vector storage and memory, have your database administrator install and enable the `vector` extension and
 provide an existing schema. The extension must be visible through the connection's
 `search_path`. The connector never creates schemas, enables extensions, or changes
 server-wide configuration. `ensure_collection_exists()` creates a vector collection's
@@ -42,6 +44,68 @@ using `client`; it remains caller-owned and bypasses settings loading.
 Injected clients cannot be combined with connection-string or `.env` options.
 Collections created by a store borrow its pool, so keep the store open while
 using them.
+
+## Workflow checkpoints
+
+`PostgresCheckpointStorage` implements the framework's `CheckpointStorage` protocol.
+It stores the complete framework-encoded snapshot in JSONB, including executor state,
+queued messages, and pending human requests. Memory extraction and retrieval are not involved.
+
+```python
+from agent_framework_postgres import PostgresCheckpointStorage
+
+storage = PostgresCheckpointStorage(
+    application_id="purchasing",
+    tenant_id="authorized-tenant",
+    run_id="purchase-1042",
+)
+```
+
+Use it as an async context manager, call `await storage.ensure_table()` once during setup,
+and pass it as `checkpoint_storage` to `WorkflowBuilder`. It resolves connection settings
+and borrows connections or pools using the same rules as the other package clients.
+`ensure_table()` requires an existing schema and table/index creation permissions; it
+does not create schemas, install extensions, or migrate incompatible tables.
+
+The default table is `agent_framework_checkpoints`, shared with the .NET provider.
+Both use the same relational schema. Every operation is scoped to application, tenant,
+run, and `payload_format`; the Python format is `agent-framework.python.checkpoint.v1`.
+Use trusted, authorized scope values, not unvalidated IDs from a request. A workflow name
+identifies a definition, not a tenant or run. Recreate the same storage scope and workflow
+graph, with stable executor identities, to resume.
+
+Sharing the table does **not** enable cross-language workflow resumption. Python's
+framework codec may embed pickled Python objects; .NET uses its own checkpoint structure.
+Each provider reads only its own format. See the [shared storage decision](../../../docs/decisions/0043-postgres-workflow-checkpoints.md)
+for the table contract.
+
+Checkpoints are immutable: saving the same ID and payload again is idempotent; saving
+different state under an existing ID raises `WorkflowCheckpointException`. History and
+`get_latest()` use database save order, not iteration counts or client timestamps.
+Saves are transactionally serialized within a run. A borrowed connection's outer
+transaction remains caller-owned: commit it before treating its checkpoints as durable,
+and use a pool for concurrent saves. `delete()` removes only the selected checkpoint,
+without cascading to children or other formats. Retention is application-managed.
+
+Only read checkpoints from trusted, access-controlled storage. For application-defined
+Python types, supply `allowed_checkpoint_types` or use `register_checkpoint_type`.
+The decoder's allowlist is defense in depth, not a security boundary. Checkpoint storage
+does not supply worker scheduling, leases, or exactly-once external side effects;
+operations after a checkpoint can repeat and should use idempotency keys.
+
+The [approval sample](samples/postgres_checkpointing.py) exits while waiting, then resumes
+in a separate process. With `POSTGRES_CONNECTION_STRING` configured, run from this package:
+
+```sh
+python samples/postgres_checkpointing.py start --tenant-id demo --run-id purchase-1042
+python samples/postgres_checkpointing.py resume --tenant-id demo --run-id purchase-1042 --decision approve
+```
+
+On Windows, Psycopg requires a selector event loop. The sample configures one at its
+entry point; library code does not change the application's event-loop policy.
+Run checkpoint tests with `POSTGRES_TEST_CONNECTION_STRING` pointing at an explicitly
+designated test database. Those tests create and remove temporary schemas and do not
+require pgvector.
 
 ## Durable memory
 

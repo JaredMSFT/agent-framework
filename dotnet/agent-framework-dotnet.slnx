@@ -279,6 +279,7 @@
     <Project Path="samples/03-workflows/Checkpoint/CheckpointAndRehydrate/CheckpointAndRehydrate.csproj" />
     <Project Path="samples/03-workflows/Checkpoint/CheckpointAndResume/CheckpointAndResume.csproj" />
     <Project Path="samples/03-workflows/Checkpoint/CheckpointWithHumanInTheLoop/CheckpointWithHumanInTheLoop.csproj" />
+    <Project Path="samples/03-workflows/Checkpoint/PostgresCheckpointing/PostgresCheckpointing.csproj" />
   </Folder>
   <Folder Name="/Samples/03-workflows/HumanInTheLoop/">
     <Project Path="samples/03-workflows/HumanInTheLoop/HumanInTheLoopBasic/HumanInTheLoopBasic.csproj" />

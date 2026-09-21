@@ -1,12 +1,65 @@
-# Microsoft Agent Framework PostgreSQL ContextMemory
+# Microsoft Agent Framework PostgreSQL
 
 `Microsoft.Agents.AI.Postgres` provides durable, cross-session agent memory backed by PostgreSQL
-and pgvector. The package separates memory processing from Agent Framework lifecycle integration:
+and pgvector, plus workflow checkpoint storage that does not require pgvector.
+The package separates memory processing from Agent Framework lifecycle integration:
 
 - `PostgresMemoryClient` owns the memory model, hybrid retrieval, processing pipeline, and
   background tasks.
 - `PostgresMemoryContextProvider` adapts the client to Agent Framework's before/after invocation
   lifecycle.
+- `PostgresCheckpointStore` implements `JsonCheckpointStore` for durable workflow recovery.
+
+## Workflow checkpoints
+
+```csharp
+using Microsoft.Agents.AI.Postgres;
+using Microsoft.Agents.AI.Workflows;
+using Npgsql;
+
+await using var checkpointDataSource = NpgsqlDataSource.Create(connectionString);
+var checkpointStore = new PostgresCheckpointStore(
+        checkpointDataSource, applicationId: "purchasing", tenantId: authenticatedTenantId);
+await checkpointStore.EnsureTableAsync();
+var checkpointManager = checkpointStore.CreateCheckpointManager();
+```
+
+Pass the manager to `InProcessExecution.RunStreamingAsync` and supply a stable `sessionId`
+for the workflow run. Later, reconstruct the same graph and executor identities, obtain
+the latest checkpoint with `checkpointManager.GetLatestCheckpointAsync(sessionId)`, and
+pass it to `InProcessExecution.ResumeStreamingAsync` with the manager.
+
+Use `CreateCheckpointManager()` to enable out-of-order JSON metadata, since JSONB
+does not preserve property order. Application-specific serializer options can be passed
+to this factory; they are copied without mutation. When constructing a manager directly
+with `CheckpointManager.CreateJson`, supply `JsonSerializerOptions` with
+`AllowOutOfOrderMetadataProperties = true` or polymorphic workflow state may fail to resume.
+
+The supplied `NpgsqlDataSource` remains caller-owned. `EnsureTableAsync` creates a table
+and index in an existing schema, with the corresponding database permissions. It does
+not create schemas, install extensions, or migrate existing tables. PostgreSQL 13 or
+later is sufficient; neither `UseVector()` nor an embedding or chat client is required.
+
+Both Python and .NET use the default `agent_framework_checkpoints` table and the same
+relational schema. The .NET `sessionId` maps to `run_id`. Queries always filter application,
+tenant, run, and `payload_format` (`agent-framework.dotnet.checkpoint.v1`). Scope values
+must come from trusted, authenticated application code. An index returns checkpoints
+oldest first in committed save order, with optional parent filtering.
+
+The table is shared, but execution payloads are SDK-specific. A .NET workflow cannot
+resume a Python checkpoint or vice versa. See the
+[shared storage decision](../../../docs/decisions/0043-postgres-workflow-checkpoints.md).
+Use database permissions to keep checkpoints private and untampered; storage scoping
+does not replace authorization. Retention is application-managed. This provider is not
+a worker scheduler or an exactly-once execution engine: external actions after the last
+checkpoint can repeat, so use idempotency keys where needed.
+
+The [approval sample](../../samples/03-workflows/Checkpoint/PostgresCheckpointing) runs
+the start and resume phases in separate processes. Set
+`POSTGRES_CHECKPOINT_CONNECTION_STRING` to an explicitly designated database to run
+`PostgresCheckpointStoreIntegrationTests`; these tests create and remove isolated schemas.
+
+## Durable memory
 
 The client stores raw turns and derives facts, procedural memories, episodic memories, thread
 summaries, and cross-thread user summaries. Derived memories include confidence metadata and can be
