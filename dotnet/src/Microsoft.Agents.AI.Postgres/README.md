@@ -168,3 +168,29 @@ original hybrid order.
 
 To run the live storage tests, set `POSTGRES_MEMORY_CONNECTION_STRING` to a PostgreSQL database with
 pgvector available, then run the `Category=Postgres` tests.
+
+### Azure reranking integration tests
+
+`AzureRankLiveIntegrationTests` provides opt-in live coverage separate from the general storage tests.
+Supply an Npgsql-format connection string through the environment; never commit credentials.
+
+| Environment variable | Purpose |
+| --- | --- |
+| `POSTGRES_AZURE_AI_CONNECTION_STRING` | An explicitly designated Azure PostgreSQL test database with `vector` and `azure_ai` already enabled. Enables the disabled-reranking and single-candidate tests. |
+| `POSTGRES_AZURE_AI_RERANKER_MODEL` | A working reranker deployment for the success test. This test requires semantic scores and fails if retrieval falls back to hybrid results. |
+| `POSTGRES_AZURE_AI_FAILURE_MODEL` | A model name configured to fail, such as a nonexistent deployment, for the fallback test. This test requires a logged database error, unchanged hybrid results, and successful subsequent reads and writes. |
+
+Missing connection or model settings skip the corresponding tests. Providing settings opts into
+real database calls; the model-dependent tests can invoke external inference and incur charges.
+Chat and embedding clients are deterministic test doubles, and all memory content is synthetic.
+No particular SQL error or extension version is required by the fallback test.
+
+The database role needs permission to create and drop schemas, tables, and indexes. Tests create
+unique `af_azure_rank_*` schemas and remove them during teardown. They do not configure model
+endpoints, modify server settings, or replace the installed reranking function.
+
+From `dotnet`, after setting the environment variables, run:
+
+```shell
+dotnet test --project tests/Microsoft.Agents.AI.Postgres.UnitTests --framework net10.0 --filter-class "*AzureRankLiveIntegrationTests"
+```
